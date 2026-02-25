@@ -9,6 +9,7 @@ across one or more DNS resolvers for a given set of domain names.
 import argparse
 import statistics
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -99,6 +100,29 @@ class ServerStats:
 # Core benchmarking logic
 # ---------------------------------------------------------------------------
 
+def _do_resolve(resolver, domain, record_type, result_holder):
+    """
+    Helper that performs the DNS resolution and stores the outcome.
+    Used by resolve_with_server to enforce a hard timeout.
+    """
+    start = time.perf_counter()
+    try:
+        answers = resolver.resolve(domain, record_type)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        result_holder.update(
+            response_time_ms=round(elapsed_ms, 3),
+            success=True,
+            answer_count=len(answers),
+        )
+    except dns.exception.DNSException as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        result_holder.update(
+            response_time_ms=round(elapsed_ms, 3),
+            success=False,
+            error=str(exc),
+        )
+
+
 def resolve_with_server(
     domain: str,
     server: str,
@@ -107,34 +131,48 @@ def resolve_with_server(
 ) -> QueryResult:
     """
     Perform a single DNS query against *server* and return a QueryResult.
+    Enforces a hard timeout so the query never blocks longer than *timeout*.
     """
     resolver = dns.resolver.Resolver(configure=False)
     resolver.nameservers = [server]
     resolver.lifetime = timeout
     resolver.timeout = timeout
 
-    start = time.perf_counter()
-    try:
-        answers = resolver.resolve(domain, record_type)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+    result_holder: dict = {
+        "response_time_ms": 0.0,
+        "success": False,
+        "answer_count": 0,
+        "error": "",
+    }
+
+    thread = threading.Thread(
+        target=_do_resolve,
+        args=(resolver, domain, record_type, result_holder),
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        # The DNS query exceeded the timeout — daemon thread will be abandoned.
         return QueryResult(
             domain=domain,
             server=server,
             record_type=record_type,
-            response_time_ms=round(elapsed_ms, 3),
-            success=True,
-            answer_count=len(answers),
-        )
-    except dns.exception.DNSException as exc:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return QueryResult(
-            domain=domain,
-            server=server,
-            record_type=record_type,
-            response_time_ms=round(elapsed_ms, 3),
+            response_time_ms=round(timeout * 1000.0, 3),
             success=False,
-            error=str(exc),
+            error="Query timed out",
         )
+
+    return QueryResult(
+        domain=domain,
+        server=server,
+        record_type=record_type,
+        response_time_ms=result_holder["response_time_ms"],
+        success=result_holder["success"],
+        answer_count=result_holder["answer_count"],
+        error=result_holder["error"],
+    )
 
 
 def run_benchmark(
